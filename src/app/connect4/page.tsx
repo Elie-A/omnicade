@@ -1,11 +1,26 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import InviteUI from "@/components/InviteUI";
 
 const ROWS = 6;
 const COLS = 7;
 
 type Cell = "R" | "Y" | null;
+type MatchStatus = "waiting" | "playing" | "completed";
+
+type MatchState = {
+  id: string;
+  gameType: "connect4";
+  host: { id: string; role: "R" | "Y" };
+  guest?: { id: string; role: "R" | "Y" };
+  turn: "R" | "Y";
+  status: MatchStatus;
+  board: Cell[][];
+  winner: "R" | "Y" | null;
+  createdAt: string;
+  updatedAt: string;
+};
 
 type Winner = {
   player: "R" | "Y";
@@ -83,17 +98,90 @@ const CONFETTI_PARTICLES = Array.from({ length: 28 }, (_, index) => ({
 export default function Connect4() {
   const [board, setBoard] = useState(createBoard());
   const [turn, setTurn] = useState<Cell>("R");
+  const [playerId, setPlayerId] = useState<string>("");
+  const [mode, setMode] = useState<"local" | "online">("local");
+  const [gameId, setGameId] = useState<string | null>(null);
+  const [matchState, setMatchState] = useState<MatchState | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [isJoining, setIsJoining] = useState(false);
+  const [onlineError, setOnlineError] = useState<string | null>(null);
 
-  const result = checkWinner(board);
-  const isDraw = !result && board.flat().every(Boolean);
+  useEffect(() => {
+    let stored = window.localStorage.getItem("omnicade-player-id");
+    if (!stored) {
+      stored = crypto.randomUUID();
+      window.localStorage.setItem("omnicade-player-id", stored);
+    }
+    setPlayerId(stored);
+  }, []);
+
+  useEffect(() => {
+    if (!gameId || mode !== "online" || !playerId) return;
+
+    // keep polling as a fallback
+    const interval = window.setInterval(async () => {
+      try {
+        const response = await fetch(
+          `/api/game/${gameId}?playerId=${playerId}`,
+        );
+        const body = await response.json();
+        if (body?.game) {
+          setMatchState(body.game as MatchState);
+        }
+      } catch (error) {
+        // ignore polling errors; we'll retry
+      }
+    }, 1500);
+
+    // SSE real-time updates
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(`/api/game/${gameId}/events`);
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data) as MatchState;
+          setMatchState(payload);
+        } catch {}
+      };
+    } catch {}
+
+    return () => {
+      window.clearInterval(interval);
+      if (es) es.close();
+    };
+  }, [gameId, mode, playerId]);
+
+  const result = useMemo(() => {
+    if (mode === "online" && matchState) {
+      return matchState.winner ? { player: matchState.winner, line: [] } : null;
+    }
+
+    return checkWinner(board);
+  }, [mode, matchState, board]);
+
+  const currentBoard =
+    mode === "online" && matchState ? matchState.board : board;
+  const currentTurn = mode === "online" && matchState ? matchState.turn : turn;
+  const isWaiting = mode === "online" && matchState?.status === "waiting";
+  const isDraw = !result && currentBoard.flat().every(Boolean);
   const finished = Boolean(result) || isDraw;
-  const status = result
-    ? `${result.player === "R" ? "Red" : "Yellow"} wins!`
-    : isDraw
-      ? "Draw!"
-      : `Turn: ${turn === "R" ? "Red" : "Yellow"}`;
+  const status = matchState
+    ? matchState.status === "waiting"
+      ? "Waiting for opponent..."
+      : result
+        ? `${result.player === "R" ? "Red" : "Yellow"} wins!`
+        : isDraw
+          ? "Draw!"
+          : `Turn: ${currentTurn === "R" ? "Red" : "Yellow"}`
+    : result
+      ? `${result.player === "R" ? "Red" : "Yellow"} wins!`
+      : isDraw
+        ? "Draw!"
+        : `Turn: ${currentTurn === "R" ? "Red" : "Yellow"}`;
 
-  const remainingMoves = board.flat().filter((cell) => cell === null).length;
+  const remainingMoves = currentBoard
+    .flat()
+    .filter((cell) => cell === null).length;
   const winnerName = result ? (result.player === "R" ? "Red" : "Yellow") : null;
   const popupTitle = result ? `🏆 ${winnerName} connects four!` : "Stalemate!";
   const popupDescription = result
@@ -102,17 +190,82 @@ export default function Connect4() {
       : "Yellow floated to victory with a perfect drop."
     : "No winner this time. Reset and try again.";
 
-  function play(col: number) {
+  function localPlay(col: number) {
     if (result || board[0][col]) return;
-
     setBoard((prev) => drop(prev, col, turn));
     setTurn((current) => (current === "R" ? "Y" : "R"));
+  }
+
+  async function onlinePlay(col: number) {
+    if (!matchState || matchState.status !== "playing") return;
+    if (
+      matchState.turn !==
+      (matchState.host.id === playerId
+        ? matchState.host.role
+        : matchState.guest?.role)
+    ) {
+      setOnlineError("It's not your turn yet.");
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/game/${matchState.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ playerId, payload: { column: col } }),
+      });
+      const body = await response.json();
+      if (body.error) {
+        setOnlineError(body.error);
+      } else if (body.game) {
+        setMatchState(body.game as MatchState);
+        setOnlineError(null);
+      }
+    } catch (error) {
+      setOnlineError("Unable to send your move. Try again.");
+    }
   }
 
   function reset() {
     setBoard(createBoard());
     setTurn("R");
+    setMatchState(null);
+    setGameId(null);
+    setOnlineError(null);
+    setMode("local");
   }
+
+  async function startMatchmaking() {
+    setIsJoining(true);
+    setOnlineError(null);
+    try {
+      const response = await fetch("/api/matchmaking", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gameType: "connect4", playerId }),
+      });
+      const body = await response.json();
+
+      if (body.error) {
+        setOnlineError(body.error);
+      } else {
+        setMode("online");
+        setMatchState(body.game as MatchState);
+        setGameId(body.gameId);
+      }
+    } catch (error) {
+      setOnlineError("Matchmaking failed. Please refresh and try again.");
+    } finally {
+      setIsJoining(false);
+    }
+  }
+
+  const isOnlinePlayerTurn =
+    matchState &&
+    matchState.turn ===
+      (matchState.host.id === playerId
+        ? matchState.host.role
+        : matchState.guest?.role);
 
   return (
     <main className="mx-auto w-full max-w-xl space-y-6">
@@ -124,13 +277,33 @@ export default function Connect4() {
               Drop pieces and connect four in a row.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={reset}
-            className="rounded-full bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
-          >
-            New game
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setMode("local")}
+              className={`rounded-full px-4 py-2 text-sm font-semibold transition ${mode === "local" ? "bg-cyan-500 text-slate-950" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}`}
+            >
+              Local
+            </button>
+            <button
+              type="button"
+              onClick={startMatchmaking}
+              disabled={isJoining}
+              className="rounded-full bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isJoining ? "Finding opponent…" : "Matchmake online"}
+            </button>
+            <div className="ml-2">
+              <InviteUI
+                gameType="connect4"
+                onJoined={(g) => {
+                  setMode("online");
+                  setMatchState(g);
+                  setGameId(g.id);
+                }}
+              />
+            </div>
+          </div>
         </div>
 
         <div className="grid gap-3 rounded-3xl bg-slate-950/75 p-4 text-sm text-slate-300 shadow-inner shadow-slate-950/10">
@@ -141,6 +314,14 @@ export default function Connect4() {
             <span className="rounded-full bg-slate-800/90 px-3 py-1 text-slate-200">
               Remaining: {remainingMoves}
             </span>
+            {mode === "online" && matchState && (
+              <span className="rounded-full bg-slate-800/90 px-3 py-1 text-slate-200">
+                You are:{" "}
+                {matchState.host.id === playerId
+                  ? matchState.host.role
+                  : (matchState.guest?.role ?? "—")}
+              </span>
+            )}
           </div>
 
           <div className="grid gap-2 sm:grid-cols-2">
@@ -165,20 +346,46 @@ export default function Connect4() {
               </p>
             </div>
           </div>
+
+          {mode === "online" && matchState?.status === "waiting" && (
+            <div className="rounded-3xl bg-slate-900/80 p-4 text-sm text-slate-200">
+              Waiting for a second player to join. Share the match ID if you
+              want to connect from another browser.
+            </div>
+          )}
+
+          {onlineError && (
+            <div className="rounded-2xl bg-rose-500/10 px-4 py-2 text-sm text-rose-200">
+              {onlineError}
+            </div>
+          )}
         </div>
       </div>
 
       <div className="grid gap-3 rounded-3xl border border-white/10 bg-slate-900/80 p-4 shadow-xl shadow-black/20">
         <div className="grid grid-cols-7 gap-1">
           {Array.from({ length: COLS }).map((_, index) => {
-            const isFull = Boolean(board[0][index]);
+            const isFull = Boolean(currentBoard[0][index]);
+            const isDisabled =
+              Boolean(finished) ||
+              isFull ||
+              (mode === "online" &&
+                (!matchState ||
+                  matchState.status !== "playing" ||
+                  !isOnlinePlayerTurn));
             return (
               <button
                 key={index}
                 type="button"
-                onClick={() => play(index)}
-                disabled={isFull || Boolean(result)}
-                className={`aspect-square rounded-2xl px-2 text-base transition ${isFull || Boolean(result) ? "bg-slate-800/60 text-slate-500 cursor-not-allowed" : "bg-slate-800 text-slate-100 hover:bg-slate-700"}`}
+                onClick={() => {
+                  if (mode === "online") {
+                    onlinePlay(index);
+                  } else {
+                    localPlay(index);
+                  }
+                }}
+                disabled={isDisabled}
+                className={`aspect-square rounded-2xl px-2 text-base transition ${isDisabled ? "bg-slate-800/60 text-slate-500 cursor-not-allowed" : "bg-slate-800 text-slate-100 hover:bg-slate-700"}`}
               >
                 ↓
               </button>
@@ -187,7 +394,7 @@ export default function Connect4() {
         </div>
 
         <div className="grid grid-cols-7 gap-1">
-          {board.flatMap((row, rowIndex) =>
+          {currentBoard.flatMap((row, rowIndex) =>
             row.map((cell, colIndex) => {
               const slotIndex = rowIndex * COLS + colIndex;
               const isWinner = result?.line.includes(slotIndex);
@@ -207,6 +414,30 @@ export default function Connect4() {
             }),
           )}
         </div>
+      </div>
+
+      <div className="flex flex-wrap gap-3">
+        <button
+          type="button"
+          onClick={reset}
+          className="rounded-full bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
+        >
+          Reset board
+        </button>
+        {mode === "online" && gameId && (
+          <button
+            type="button"
+            onClick={() => {
+              setMode("local");
+              setMatchState(null);
+              setGameId(null);
+              setOnlineError(null);
+            }}
+            className="rounded-full bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-200 transition hover:bg-slate-700"
+          >
+            Leave match
+          </button>
+        )}
       </div>
 
       {finished ? (

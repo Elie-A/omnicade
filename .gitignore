@@ -24,6 +24,10 @@
 .DS_Store
 *.pem
 
+# runtime state
+/data/server-state.json
+/data/*.bak
+
 # debug
 npm-debug.log*
 yarn-debug.log*

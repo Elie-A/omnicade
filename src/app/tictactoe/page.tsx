@@ -1,8 +1,23 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import InviteUI from "@/components/InviteUI";
 
 type Player = "X" | "O" | null;
+type MatchStatus = "waiting" | "playing" | "completed";
+
+type MatchState = {
+  id: string;
+  gameType: "tictactoe";
+  host: { id: string; role: "X" | "O" };
+  guest?: { id: string; role: "X" | "O" };
+  turn: "X" | "O";
+  status: MatchStatus;
+  board: Player[];
+  winner: "X" | "O" | null;
+  createdAt: string;
+  updatedAt: string;
+};
 
 type Winner = {
   player: "X" | "O";
@@ -45,18 +60,88 @@ const CONFETTI_PARTICLES = Array.from({ length: 28 }, (_, index) => ({
 export default function TicTacToe() {
   const [board, setBoard] = useState<Player[]>(Array(9).fill(null));
   const [turn, setTurn] = useState<"X" | "O">("X");
+  const [playerId, setPlayerId] = useState<string>("");
+  const [mode, setMode] = useState<"local" | "online">("local");
+  const [gameId, setGameId] = useState<string | null>(null);
+  const [matchState, setMatchState] = useState<MatchState | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [isJoining, setIsJoining] = useState(false);
+  const [onlineError, setOnlineError] = useState<string | null>(null);
 
-  const result = checkWinner(board);
-  const isDraw = !result && board.every(Boolean);
+  useEffect(() => {
+    let stored = window.localStorage.getItem("omnicade-player-id");
+    if (!stored) {
+      stored = crypto.randomUUID();
+      window.localStorage.setItem("omnicade-player-id", stored);
+    }
+    setPlayerId(stored);
+  }, []);
+
+  useEffect(() => {
+    if (!gameId || mode !== "online" || !playerId) return;
+
+    // keep polling as a fallback
+    const interval = window.setInterval(async () => {
+      try {
+        const response = await fetch(
+          `/api/game/${gameId}?playerId=${playerId}`,
+        );
+        const body = await response.json();
+        if (body?.game) {
+          setMatchState(body.game as MatchState);
+        }
+      } catch (error) {
+        // ignore polling errors; we'll retry
+      }
+    }, 1500);
+
+    // SSE real-time updates
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(`/api/game/${gameId}/events`);
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data) as MatchState;
+          setMatchState(payload);
+        } catch {}
+      };
+    } catch {}
+
+    return () => {
+      window.clearInterval(interval);
+      if (es) es.close();
+    };
+  }, [gameId, mode, playerId]);
+
+  const result = useMemo(() => {
+    if (mode === "online" && matchState) {
+      return matchState.winner ? { player: matchState.winner, line: [] } : null;
+    }
+    return checkWinner(board);
+  }, [mode, matchState, board]);
+
+  const currentBoard =
+    mode === "online" && matchState ? matchState.board : board;
+  const currentTurn = mode === "online" && matchState ? matchState.turn : turn;
+  const isWaiting = mode === "online" && matchState?.status === "waiting";
+  const isDraw = !result && currentBoard.every(Boolean);
   const finished = Boolean(result) || isDraw;
-  const status = result
-    ? `${result.player} wins!`
-    : isDraw
-      ? "Draw!"
-      : `Turn: ${turn}`;
+  const status = matchState
+    ? matchState.status === "waiting"
+      ? "Waiting for opponent..."
+      : result
+        ? `${result.player} wins!`
+        : isDraw
+          ? "Draw!"
+          : `Turn: ${currentTurn}`
+    : result
+      ? `${result.player} wins!`
+      : isDraw
+        ? "Draw!"
+        : `Turn: ${currentTurn}`;
 
   const winningCells = result?.line ?? [];
-  const moves = board.filter(Boolean).length;
+  const moves = currentBoard.filter(Boolean).length;
   const popupTitle = result ? `🎉 ${result.player} wins!` : "Stalemate!";
   const popupDescription = result
     ? result.player === "X"
@@ -64,20 +149,82 @@ export default function TicTacToe() {
       : "O closes out the match with a smooth finish."
     : "Nobody won this round. Reset and try a different strategy.";
 
-  function play(i: number) {
-    if (board[i] || result) return;
-
+  function localPlay(i: number) {
+    if (currentBoard[i] || result) return;
     const next = [...board];
     next[i] = turn;
-
     setBoard(next);
     setTurn((current) => (current === "X" ? "O" : "X"));
+  }
+
+  async function onlinePlay(i: number) {
+    if (!matchState || matchState.status !== "playing") return;
+    const playerRole =
+      matchState.host.id === playerId
+        ? matchState.host.role
+        : matchState.guest?.role;
+    if (!playerRole || playerRole !== matchState.turn) {
+      setOnlineError("It's not your turn yet.");
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/game/${matchState.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ playerId, payload: { index: i } }),
+      });
+      const body = await response.json();
+      if (body.error) {
+        setOnlineError(body.error);
+      } else if (body.game) {
+        setMatchState(body.game as MatchState);
+        setOnlineError(null);
+      }
+    } catch (error) {
+      setOnlineError("Unable to send your move. Try again.");
+    }
   }
 
   function reset() {
     setBoard(Array(9).fill(null));
     setTurn("X");
+    setMatchState(null);
+    setGameId(null);
+    setOnlineError(null);
+    setMode("local");
   }
+
+  async function startMatchmaking() {
+    setIsJoining(true);
+    setOnlineError(null);
+    try {
+      const response = await fetch("/api/matchmaking", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gameType: "tictactoe", playerId }),
+      });
+      const body = await response.json();
+      if (body.error) {
+        setOnlineError(body.error);
+      } else {
+        setMode("online");
+        setMatchState(body.game as MatchState);
+        setGameId(body.gameId);
+      }
+    } catch (error) {
+      setOnlineError("Matchmaking failed. Please refresh and try again.");
+    } finally {
+      setIsJoining(false);
+    }
+  }
+
+  const playerRole =
+    matchState?.host.id === playerId
+      ? matchState.host.role
+      : matchState?.guest?.role;
+  const canMoveOnline =
+    matchState?.status === "playing" && playerRole === matchState.turn;
 
   return (
     <main className="mx-auto w-full max-w-xs space-y-6">
@@ -89,13 +236,33 @@ export default function TicTacToe() {
               A quick, polished 3×3 matchup.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={reset}
-            className="rounded-full bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
-          >
-            New game
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setMode("local")}
+              className={`rounded-full px-4 py-2 text-sm font-semibold transition ${mode === "local" ? "bg-cyan-500 text-slate-950" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}`}
+            >
+              Local
+            </button>
+            <button
+              type="button"
+              onClick={startMatchmaking}
+              disabled={isJoining}
+              className="rounded-full bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isJoining ? "Finding opponent…" : "Matchmake online"}
+            </button>
+            <div className="ml-2">
+              <InviteUI
+                gameType="tictactoe"
+                onJoined={(g) => {
+                  setMode("online");
+                  setMatchState(g);
+                  setGameId(g.id);
+                }}
+              />
+            </div>
+          </div>
         </div>
 
         <div className="grid gap-3 rounded-3xl bg-slate-950/75 p-4 text-sm text-slate-300 shadow-inner shadow-slate-950/10">
@@ -107,8 +274,13 @@ export default function TicTacToe() {
               Moves: {moves}
             </span>
             <span className="rounded-full bg-slate-800/90 px-3 py-1 text-slate-200">
-              Next: {result ? "—" : turn}
+              Next: {finished ? "—" : currentTurn}
             </span>
+            {mode === "online" && matchState && (
+              <span className="rounded-full bg-slate-800/90 px-3 py-1 text-slate-200">
+                You are: {playerRole ?? "—"}
+              </span>
+            )}
           </div>
 
           <div className="grid gap-2 sm:grid-cols-2">
@@ -135,23 +307,69 @@ export default function TicTacToe() {
               </p>
             </div>
           </div>
+
+          {mode === "online" && matchState?.status === "waiting" && (
+            <div className="rounded-3xl bg-slate-900/80 p-4 text-sm text-slate-200">
+              Waiting for an opponent to join. Once another player connects, the
+              match begins.
+            </div>
+          )}
+
+          {onlineError && (
+            <div className="rounded-2xl bg-rose-500/10 px-4 py-2 text-sm text-rose-200">
+              {onlineError}
+            </div>
+          )}
         </div>
       </div>
 
       <div className="grid grid-cols-3 gap-2 rounded-3xl border border-white/10 bg-slate-900/80 p-4 shadow-xl shadow-black/20">
-        {board.map((cell, i) => {
+        {currentBoard.map((cell, i) => {
           const isWinner = winningCells.includes(i);
+          const disabled =
+            Boolean(cell) ||
+            finished ||
+            (mode === "online" &&
+              (!canMoveOnline || matchState?.status !== "playing"));
           return (
             <button
               key={i}
               type="button"
-              onClick={() => play(i)}
+              onClick={() => {
+                if (mode === "online") onlinePlay(i);
+                else localPlay(i);
+              }}
+              disabled={disabled}
               className={`aspect-square rounded-3xl border border-white/10 bg-slate-950/90 text-3xl font-semibold text-white transition focus:outline-none focus:ring-2 focus:ring-cyan-400/60 ${isWinner ? "bg-cyan-500 text-slate-950 shadow-[0_0_0_8px_rgba(56,189,248,0.16)]" : "hover:bg-slate-900"}`}
             >
               {cell}
             </button>
           );
         })}
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <button
+          type="button"
+          onClick={reset}
+          className="rounded-full bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
+        >
+          Reset board
+        </button>
+        {mode === "online" && gameId && (
+          <button
+            type="button"
+            onClick={() => {
+              setMode("local");
+              setMatchState(null);
+              setGameId(null);
+              setOnlineError(null);
+            }}
+            className="rounded-full bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-200 transition hover:bg-slate-700"
+          >
+            Leave match
+          </button>
+        )}
       </div>
 
       {finished ? (

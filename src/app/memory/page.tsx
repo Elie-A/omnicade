@@ -24,6 +24,8 @@ function buildCards(pairCount: number) {
   return [...selected, ...selected].sort(() => Math.random() - 0.5);
 }
 
+const STORAGE_KEY = "omnicade-memory-state";
+
 export default function Memory() {
   const minPairs = 2;
   const maxPairs = emojiPool.length;
@@ -34,6 +36,43 @@ export default function Memory() {
   const [matched, setMatched] = useState<number[]>([]);
   const [disabled, setDisabled] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [playerId, setPlayerId] = useState<string>("");
+  const [scoreSubmitted, setScoreSubmitted] = useState(false);
+
+  useEffect(() => {
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored) as {
+          pairCount: number;
+          customPairs: string;
+          cards: string[];
+          flipped: number[];
+          matched: number[];
+        };
+        setPairCount(parsed.pairCount);
+        setCustomPairs(parsed.customPairs);
+        setCards(parsed.cards);
+        setFlipped(parsed.flipped);
+        setMatched(parsed.matched);
+      } catch {
+        window.localStorage.removeItem(STORAGE_KEY);
+      }
+    }
+    let storedId = window.localStorage.getItem("omnicade-player-id");
+    if (!storedId) {
+      storedId = crypto.randomUUID();
+      window.localStorage.setItem("omnicade-player-id", storedId);
+    }
+    setPlayerId(storedId);
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ pairCount, customPairs, cards, flipped, matched }),
+    );
+  }, [pairCount, customPairs, cards, flipped, matched]);
 
   useEffect(() => {
     if (flipped.length !== 2) return;
@@ -66,6 +105,7 @@ export default function Memory() {
 
   function resetGame(updatedPairs = pairCount) {
     setPairCount(updatedPairs);
+    setCustomPairs(updatedPairs.toString());
     setFlipped([]);
     setMatched([]);
     setDisabled(false);
@@ -74,6 +114,28 @@ export default function Memory() {
 
   const pairsMatched = matched.length / 2;
   const isComplete = pairsMatched === pairCount;
+
+  useEffect(() => {
+    if (!isComplete || scoreSubmitted) return;
+    // submit score (pairs matched) to server
+    const submit = async () => {
+      try {
+        await fetch("/api/score", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            playerId,
+            gameType: "memory",
+            value: pairsMatched,
+          }),
+        });
+        setScoreSubmitted(true);
+      } catch {
+        // ignore failures for now
+      }
+    };
+    submit();
+  }, [isComplete, scoreSubmitted, playerId, pairsMatched]);
 
   return (
     <main className="mx-auto w-full max-w-xs space-y-6">
